@@ -1,0 +1,19 @@
+# === Datasets and temporary data ===
+dataset/
+yolo_dataset/
+
+# === Checkpoints and weights ===
+*.zip
+
+# === Logs ===
+
+# === Notebooks ===
+.ipynb_checkpoints/
+
+# === Python ===
+__pycache__/
+*.py[cod]
+
+# === OS/editor trash ===
+.DS_Store
+*.swp

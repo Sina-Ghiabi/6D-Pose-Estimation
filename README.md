@@ -50,6 +50,31 @@ Run the notebooks **in order**:
 
 ---
 
+## ⚠️ Disk Space Strategy: Process Classes in Batches of 3
+
+Extracting and preprocessing the full 13-class LineMOD dataset **all at once does not fit**
+on a standard Google Colab local disk (~113 GB) — this is especially true once
+`02_preprocess.ipynb` generates 9 full-resolution radius maps per frame. Trying to extract
+everything in one pass reliably ends in `OSError: [Errno 28] No space left on device`,
+even when the extraction target is Google Drive itself (Colab's Drive mount still stages
+every write through local disk before syncing, so it hits the same wall).
+
+The workflow that actually works — **process 3 classes at a time**:
+
+1. Pick **3 classes** (edit `EXTRACT_THESE_CLASSES` in `01_setup.ipynb` Cell 6).
+2. Run `01_setup.ipynb` → `02_preprocess.ipynb` for just those 3 classes — extraction through
+   all preprocessing steps (poses, radius maps, splits), stopping **before** modeling.
+3. Save the preprocessed output for those 3 classes back to Google Drive so it persists.
+4. **Fully disconnect the Colab runtime** (`Runtime → Disconnect and delete runtime`) to
+   reclaim local disk — a plain "Restart runtime" does *not* free disk, only the kernel.
+5. Reconnect, pick the **next 3 classes**, and repeat steps 1–4.
+6. Once all 13 classes have been extracted + preprocessed this way and saved to Drive, move
+   on to `03_yolo_train.ipynb` / `04_pose_train.ipynb` (modeling) — training needs all classes
+   present together (it uses `ConcatDataset` across classes, so partial/sequential training
+   per class is **not** an option — that causes catastrophic forgetting).
+
+---
+
 ## 🏗️ Model Architecture: EnhancedRCVPose
 
 ```

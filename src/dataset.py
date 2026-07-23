@@ -193,5 +193,6 @@ class PoseDataset(Dataset):
                 'pose': torch.from_numpy(pose_vec).float(),
                 'radius_maps': torch.from_numpy(radius_maps).float(),
             }
-        except Exception:
+        except Exception as e:
+            print(f'⚠️  Skipping sample {base} in {self.obj_dir}: {e}')
             return None

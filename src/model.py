@@ -60,7 +60,7 @@ class FeaturePyramidNetwork(nn.Module):
 class EnhancedRCVPose(nn.Module):
     """Main model: RGB + depth -> pose (7,) and outside9 radius maps (9, H, W)."""
 
-    def __init__(self, fpn_out_channels: int = 256, pose_hidden: int = 512):
+    def __init__(self, fpn_out_channels: int = 256, pose_hidden: int = 128):
         super().__init__()
 
         resnet = models.resnet50(pretrained=True)

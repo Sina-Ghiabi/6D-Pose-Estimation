@@ -81,7 +81,17 @@ def safe_collate(batch):
 
 
 class AdvancedAugmentation:
-    """Colour jitter + small random rotation applied to rgb/depth/mask together."""
+    """
+    Colour jitter + depth noise applied to rgb/depth/mask.
+
+    Deliberately does NOT rotate the image in-plane (unlike an earlier version):
+    the pose (R,t) and radius_maps ground truth are computed from the original,
+    un-rotated frame and are not cheap to re-derive for a rotated view without
+    risking a sign/convention error in the compensating rotation. Rotating the
+    image without rotating those targets to match introduces up to +/-10 deg of
+    systematic label noise on every augmented sample, which is worse than the
+    modest robustness gained from in-plane rotation augmentation.
+    """
 
     def __init__(self):
         self.color_jitter = transforms.ColorJitter(
@@ -90,11 +100,6 @@ class AdvancedAugmentation:
 
     def __call__(self, rgb, depth, mask):
         rgb = self.color_jitter(rgb)
-
-        angle = np.random.uniform(-10, 10)
-        rgb = transforms.functional.rotate(rgb, angle, expand=False)
-        depth = transforms.functional.rotate(depth, angle, expand=False)
-        mask = transforms.functional.rotate(mask, angle, expand=False)
 
         depth_np = np.array(depth).astype(np.float32)
         noise = np.random.normal(scale=0.01, size=depth_np.shape).astype(np.float32)

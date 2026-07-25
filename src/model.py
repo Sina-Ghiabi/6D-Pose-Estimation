@@ -2,8 +2,14 @@
 EnhancedRCVPose: dual-branch (RGB + depth) 6D pose estimation model.
 
 Architecture: ResNet50 backbones (one per modality) -> FPN -> attention -> fusion,
-then two heads: pose (7-D translation + quaternion) and outside9 (per-pixel radius
-maps for 9 keypoints, upsampled to input resolution).
+then two heads: pose (3-D translation + 6-D continuous rotation, Zhou et al. 2019)
+and outside9 (per-pixel radius maps for 9 keypoints, upsampled to input resolution).
+
+The 6-D rotation representation avoids the discontinuities and double-cover
+ambiguity (q vs -q) that make quaternions harder to regress directly; ground-truth
+poses are still stored/consumed as [t, quaternion] everywhere outside this module
+(dataset, ICP, metrics) -- only the network's raw output and its loss decode to/from
+the 6-D form, via rot6d_to_matrix / quat_to_matrix below.
 """
 
 import torch
@@ -58,7 +64,7 @@ class FeaturePyramidNetwork(nn.Module):
 
 
 class EnhancedRCVPose(nn.Module):
-    """Main model: RGB + depth -> pose (7,) and outside9 radius maps (9, H, W)."""
+    """Main model: RGB + depth -> pose (9,: 3 trans + 6-D rotation) and outside9 radius maps (9, H, W)."""
 
     def __init__(self, fpn_out_channels: int = 256, pose_hidden: int = 128):
         super().__init__()
@@ -95,7 +101,7 @@ class EnhancedRCVPose(nn.Module):
             nn.Linear(fpn_out_channels, pose_hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(pose_hidden, 7),
+            nn.Linear(pose_hidden, 9),  # 3 translation + 6 continuous rotation params
         )
 
         self.outside9_head = nn.Sequential(
@@ -142,8 +148,31 @@ class EnhancedRCVPose(nn.Module):
         return pose, outside9
 
 
+def rot6d_to_matrix(x: torch.Tensor) -> torch.Tensor:
+    """Zhou et al. 2019 continuity-friendly 6-D -> 3x3 rotation matrix. x: (B, 6)."""
+    a1, a2 = x[:, 0:3], x[:, 3:6]
+    b1 = F.normalize(a1, dim=1)
+    b2 = a2 - (b1 * a2).sum(dim=1, keepdim=True) * b1
+    b2 = F.normalize(b2, dim=1)
+    b3 = torch.cross(b1, b2, dim=1)
+    return torch.stack([b1, b2, b3], dim=-1)  # (B, 3, 3), columns b1/b2/b3
+
+
+def quat_to_matrix(q: torch.Tensor) -> torch.Tensor:
+    """q: (B, 4) as (x, y, z, w) -> (B, 3, 3) rotation matrix."""
+    q = F.normalize(q, dim=1)
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    B = q.shape[0]
+    R = torch.stack([
+        1 - 2 * (y ** 2 + z ** 2), 2 * (x * y - z * w),     2 * (x * z + y * w),
+        2 * (x * y + z * w),     1 - 2 * (x ** 2 + z ** 2), 2 * (y * z - x * w),
+        2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x ** 2 + y ** 2),
+    ], dim=1).view(B, 3, 3)
+    return R
+
+
 class WeightedPoseLoss(nn.Module):
-    """Weighted translation MSE + geodesic rotation loss + radius-map MSE."""
+    """Weighted translation MSE + geodesic rotation loss (6-D repr) + radius-map MSE."""
 
     def __init__(self, w_trans: float = 1.0, w_rot: float = 10.0, w_pts: float = 1.0):
         super().__init__()
@@ -154,10 +183,13 @@ class WeightedPoseLoss(nn.Module):
     def forward(self, pred_pose, target_pose, pred_outside9, target_outside9):
         trans_loss = F.mse_loss(pred_pose[:, :3], target_pose[:, :3])
 
-        pred_rot = F.normalize(pred_pose[:, 3:], dim=1)
-        target_rot = F.normalize(target_pose[:, 3:], dim=1)
-        dot = torch.sum(pred_rot * target_rot, dim=1).clamp(-1 + 1e-7, 1 - 1e-7)
-        rot_loss = (2 * torch.acos(torch.abs(dot))).mean()
+        R_pred = rot6d_to_matrix(pred_pose[:, 3:9])
+        R_gt   = quat_to_matrix(target_pose[:, 3:7])
+        # Geodesic angle of the relative rotation R_pred^T @ R_gt: trace = 1 + 2*cos(theta).
+        # Same angular quantity as the old 2*arccos(|q_pred . q_gt|) quaternion formula.
+        trace = torch.diagonal(torch.bmm(R_pred.transpose(1, 2), R_gt), dim1=-2, dim2=-1).sum(-1)
+        cos_theta = ((trace - 1) / 2).clamp(-1 + 1e-7, 1 - 1e-7)
+        rot_loss = torch.acos(cos_theta).mean()
 
         pts_loss = F.mse_loss(pred_outside9, target_outside9)
 

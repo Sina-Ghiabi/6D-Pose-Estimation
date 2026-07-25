@@ -115,6 +115,7 @@ class PoseDataset(Dataset):
       - depth        : (1, H, W) float, metres
       - pose         : (7,) float, [tx,ty,tz,qx,qy,qz,qw]
       - radius_maps  : (num_radius_pts, H, W) float, metres -- computed on-the-fly
+      - mask         : (H, W) float, 1.0 where the object is visible, else 0.0
     """
 
     MEAN_RGB = [0.485, 0.456, 0.406]
@@ -197,6 +198,7 @@ class PoseDataset(Dataset):
                 'depth': depth_t.float(),
                 'pose': torch.from_numpy(pose_vec).float(),
                 'radius_maps': torch.from_numpy(radius_maps).float(),
+                'mask': torch.from_numpy((mask > 0).astype(np.float32)),
             }
         except Exception as e:
             print(f'⚠️  Skipping sample {base} in {self.obj_dir}: {e}')

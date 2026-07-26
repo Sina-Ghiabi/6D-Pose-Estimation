@@ -1,0 +1,18 @@
+# Install PyTorch separately first (CUDA 11.8 build), then the rest:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r requirements.txt
+torch>=2.0
+torchvision
+ultralytics
+open3d
+opencv-python
+Pillow
+scikit-image
+scipy
+numpy
+pandas
+matplotlib
+tqdm
+PyYAML
+colorama
+numba

@@ -1,243 +1,241 @@
-# 🎯 6D Pose Estimation with EnhancedRCVPose + YOLOv8
+# 🎯 6D Pose Estimation — EnhancedRCVPose + YOLOv8
 
-A full pipeline for **6D object pose estimation** on the **LineMOD dataset**, combining YOLOv8 object detection with an EnhancedRCVPose model that uses RGB-D input, Feature Pyramid Networks, attention modules, and radius map supervision.
+A complete, Colab-first pipeline for **6D object pose estimation** on the **LINEMOD** dataset:
+an RGB-D dual-backbone network (**EnhancedRCVPose**) predicts each object's full 3D rotation +
+translation, refined at inference time with depth-based ICP, alongside a **YOLOv8** detector for
+2D bounding boxes.
+
+Six notebooks take you from raw dataset zips to a trained, evaluated, visualized model —
+`01_setup` → `02_preprocess` → `03_yolo_train` → `04_pose_train` → `05_evaluate` → `06_visualize`.
+
+---
+
+## 📊 Results
+
+Validation set, 13 LINEMOD classes, held-out split never seen during training:
+
+| Metric | Mean | What it means |
+|---|---|---|
+| **Translation RMSE** | **~2.2 cm** | 3D position error |
+| **Rotation Error** | **~8.5°** | geodesic angular error |
+| **ADD Success Rate** | **~98.8%** | fraction of frames with correct pose (ADD metric, per-class threshold) |
+
+Most classes individually land translation error under 2 cm and rotation error under 8°; a
+couple of harder/larger objects (e.g. `benchvise`) run higher — see `05_evaluate.ipynb`'s
+per-class table for the full breakdown.
+
+---
+
+## 🏗️ Architecture — EnhancedRCVPose
+
+```
+RGB  (3, H, W)  ──► ResNet50 backbone ──► FPN ──► Attention ──┐
+                                                                ├──► Fusion (concat + conv)
+Depth (1, H, W) ──► ResNet50 backbone ──► FPN ──► Attention ──┘
+                                                      │
+                                          ┌───────────┴───────────┐
+                                   Global AvgPool            Outside9 Head
+                                          │                        │
+                                    Pose Head                (9, H, W) radius maps
+                                          │                  (auxiliary supervision)
+                        [tx, ty, tz, 6-D continuous rotation]
+                                          │
+                              decoded to [t, quaternion] for
+                              ICP refinement / metrics / viz
+```
+
+- **Dual ResNet50 backbone** — separate pretrained encoders for RGB and depth (depth `conv1`
+  initialised from the mean of the RGB `conv1` weights).
+- **FPN + self-attention** on each modality, fused by concatenation + conv.
+- **Pose head → 9-D output**: 3 translation + a **6-D continuous rotation representation**
+  ([Zhou et al., 2019](https://arxiv.org/abs/1812.07035)) instead of a raw quaternion. Quaternions
+  have a discontinuity/double-cover ambiguity (`q` and `-q` are the same rotation) that makes them
+  measurably harder for a network to regress directly; decoding 6-D → a proper rotation matrix via
+  Gram-Schmidt avoids that. The loss compares rotations via the geodesic angle between matrices
+  (`arccos((trace(Rᵀ·R_gt) − 1) / 2)`) — the same angular quantity the earlier quaternion formula
+  used, so the loss weight didn't need retuning when this changed.
+- **Outside9 head** — 9 per-pixel radius maps (distance from each pixel to one of 9 FPS-sampled
+  3D keypoints), trained as auxiliary supervision.
+
+---
+
+## 🔬 Key engineering decisions
+
+A few points worth knowing before reading the notebooks — these came out of debugging real
+accuracy problems, not just architecture choices made up front.
+
+### Radius maps are computed on-the-fly, never stored to disk
+Earlier versions of this pipeline precomputed 9 folders per class (`Out_pt1_dm` … `Out_pt9_dm`),
+one `.npy` file *per training image per keypoint*. That's a 9× multiplier on top of the already
+large LINEMOD dataset — far too much to fit on a Colab session's local disk, let alone transfer
+from Drive. `PoseDataset` (`src/dataset.py`) now computes all 9 radius maps **at load time**,
+directly from `depth` + `mask` + `pose` + `Outside9.npy` (just 9 keypoint coordinates, not
+thousands of files), using a `numba`-JIT-compiled kernel run in parallel across `DataLoader`
+workers. Local disk per class now stays close to the raw sensor data size, and `02_preprocess.ipynb`
+actively deletes any leftover `Out_pt*_dm/` folders from older runs.
+
+### The regressed translation is replaced with a depth-measured one before ICP
+The pose head's translation is regressed from a single globally-pooled feature vector — it never
+sees *where* in the frame the object actually is, which made it the weakest part of the raw
+prediction (~10 cm error). Before ICP refinement, `05_evaluate.ipynb` instead computes the
+centroid of the real, depth-sensor-measured 3D points inside the object's mask and uses that as
+the translation starting point (keeping the network's predicted rotation). This alone cut
+Translation RMSE by roughly 4–5×, since it replaces a hard image-regression problem with a direct
+geometric measurement.
+
+### Two-stage ICP refinement
+`refine_icp()` runs a coarse point-to-point pass (loose correspondence threshold, to capture large
+initial offsets) followed by a finer point-to-plane pass (tight threshold, seeded by the coarse
+result) against the observed depth point cloud — more accurate than a single point-to-point pass
+alone, and the network's output is treated throughout as an *initial guess*, never scored directly.
+
+### In-plane rotation augmentation was removed, not fixed
+An earlier version rotated the RGB/depth/mask images for training augmentation but never rotated
+the corresponding pose/radius-map targets to match, silently injecting up to ±10° of label noise
+into every augmented sample. Computing the correct compensating rotation is a real fix but risks a
+sign/convention error that's hard to catch without live testing; removing the rotation step (color
+jitter + depth noise remain) is the safer trade — it costs a small amount of augmentation
+diversity in exchange for zero risk of a *new*, harder-to-detect bug.
+
+---
+
+## 🚀 Quick Start (Google Colab)
+
+Run the notebooks **in order**, in the same Colab session/runtime:
+
+| Step | Notebook | What it does |
+|---|---|---|
+| 1 | `01_setup.ipynb` | Mount Drive, install packages, verify GPU, write `config.json`, clone this repo |
+| 2 | `02_preprocess.ipynb` | Extract + preprocess each class end-to-end (poses, keypoints, splits) |
+| 3 | `03_yolo_train.ipynb` | Train YOLOv8s for 2D object detection |
+| 4 | `04_pose_train.ipynb` | Train EnhancedRCVPose — frozen warm-up → full fine-tune → rotation fine-tune |
+| 5 | `05_evaluate.ipynb` | Validation + held-out test metrics (Translation RMSE, Rotation Error, ADD) |
+| 6 | `06_visualize.ipynb` | Pose wireframe overlays, YOLO detections, radius-map heatmaps |
+
+Every notebook reads `/content/config.json` (written by `01_setup.ipynb`) — no paths are
+hardcoded or copy-pasted between notebooks.
+
+**Local / non-Colab setup:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
+The notebooks assume Colab-style paths (`/content/...`) and Google Drive mounting; adapt
+`01_setup.ipynb`'s config cell if running elsewhere.
+
+---
+
+## 📉 Training strategy & loss
+
+**Three stages** (`04_pose_train.ipynb`):
+
+| Stage | Epochs | Backbone | LR schedule | Notes |
+|---|---|---|---|---|
+| 1 — Warm-up | 15 | frozen | `OneCycleLR`, peak `1e-3` | Only `pose_head`/`outside9_head` train; BatchNorm frozen too |
+| 2 — Full fine-tune | up to 65 | unfrozen | fresh `OneCycleLR`, peak `3e-4` | Early stopping, `patience=15` |
+| 3 — Rotation fine-tune | 10 | frozen again | `CosineAnnealingLR`, `1e-4` | Same rotation weight as main training |
+
+`WeightedPoseLoss`:
+```
+L = W_TRANS · L_trans + W_ROT · L_rot + W_PTS · L_pts        (1.0, 10.0, 1.0)
+```
+- `L_trans` — MSE on `[tx, ty, tz]`
+- `L_rot` — geodesic angle between the predicted (6-D-decoded) and ground-truth rotation matrices
+- `L_pts` — MSE on the 9 predicted radius maps
+
+Gradient accumulation, AMP (`autocast` + `GradScaler`), `pin_memory`, and `persistent_workers`
+are used throughout; batch size / worker count auto-scale to the detected GPU (H100/A100/T4).
+
+---
+
+## 📐 Evaluation pipeline
+
+`05_evaluate.ipynb`, per sample:
+1. Run the network → decode the 9-D output to `[t, quaternion]`.
+2. Replace `t` with the depth+mask centroid translation guess (see above).
+3. Refine `[t, quaternion]` with two-stage ICP against the observed depth point cloud.
+4. Score against ground truth: Translation RMSE, Rotation Error, Points MSE, ADD, ADD Success %.
+
+ADD success uses **per-class thresholds** (`config.json`'s `ADD_THRESHOLDS`, standard LINEMOD
+benchmark values) and mesh points loaded unscaled (matching this project's original reference
+implementation), so results are directly comparable across runs.
+
+---
+
+## 🗃️ Dataset: LINEMOD
+
+13 classes (2 of the standard 15 are excluded — texture-poor/ambiguous geometry):
+
+`ape · benchvise · cam · can · cat · driller · duck · eggbox · glue · holepuncher · iron · lamp · phone`
+
+**Split per class** (`02_preprocess.ipynb`, deterministic per-class seed): **70% train / 20% val
+/ 10% test** — test is held out and should only be scored once at the end.
+
+**Per-class layout after preprocessing:**
+```
+data/XX/
+  rgb/          RGB images (.png)
+  depth/        Depth images (.dpt — binary uint16, millimetres)
+  pose/         Ground-truth [R|t] matrices (.npy, 3x4), translation in metres
+  mask/         Object masks (.png)
+  mesh.ply      3D model — ADD metric + visualization
+  Outside9.npy  9 FPS-sampled 3D keypoints (mm) — radius maps derived from these on-the-fly
+  Split/        train.txt / val.txt / test.txt
+  gt.yml        Original ground-truth (kept for reference; not read after preprocessing)
+```
 
 ---
 
 ## 📁 Project Structure
 
 ```
-6D-pose-estimation-main/
-│
-├── 01_setup.ipynb          # Environment setup, Drive mount, dataset download
-├── 02_preprocess.ipynb     # Pose extraction, radius maps, train/val/test splits
-├── 03_yolo_train.ipynb     # YOLOv8s object detection training
-├── 04_pose_train.ipynb     # EnhancedRCVPose training (2-stage + fine-tune)
-├── 05_evaluate.ipynb       # Validation + test evaluation (Trans RMSE, Rot, ADD)
-├── 06_visualize.ipynb      # Pose wireframe, YOLO detections, radius map heatmaps
-│
+6D-pose-estimation/
+├── 01_setup.ipynb          # Env setup, Drive mount, GPU check, config.json, repo clone
+├── 02_preprocess.ipynb     # Per-class extraction, poses, keypoints, splits
+├── 03_yolo_train.ipynb     # YOLOv8s detection training
+├── 04_pose_train.ipynb     # EnhancedRCVPose training (3 stages)
+├── 05_evaluate.ipynb       # Validation + test metrics
+├── 06_visualize.ipynb      # Pose overlays, YOLO detections, radius-map heatmaps
 ├── src/
-│   ├── model.py            # EnhancedRCVPose architecture + WeightedPoseLoss
-│   └── dataset.py          # PoseDataset, safe_collate, augmentation
-│
-├── configs/
-│   └── linemod_final.yaml  # Dataset configuration
-│
-├── checkpoints/
-│   └── yolo_model.pt       # Example YOLO checkpoint
-│
-├── sample_output/          # Sample prediction images
+│   ├── model.py             # EnhancedRCVPose, WeightedPoseLoss, 6-D rotation helpers
+│   └── dataset.py           # PoseDataset (on-the-fly radius maps), augmentation, safe_collate
 ├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## 🚀 Quick Start (Google Colab)
-
-Run the notebooks **in order**:
-
-| Step | Notebook | Action |
-|------|----------|--------|
-| 1 | `01_setup.ipynb` | Mount Drive, install packages, clone repo, extract LineMOD |
-| 2 | `02_preprocess.ipynb` | Extract poses, compute radius maps, build splits |
-| 3 | `03_yolo_train.ipynb` | Train YOLOv8s for bounding box detection |
-| 4 | `04_pose_train.ipynb` | Train EnhancedRCVPose (stage 1 + 2 + fine-tune) |
-| 5 | `05_evaluate.ipynb` | Compute validation and test metrics |
-| 6 | `06_visualize.ipynb` | Visualize predictions with 3D mesh overlays |
-
-> Each notebook reads from `/content/config.json` written by `01_setup.ipynb` — no hardcoded paths.
-
----
-
-## ⚠️ Disk Space Strategy: Process Classes in Batches of 3
-
-Extracting and preprocessing the full 13-class LineMOD dataset **all at once does not fit**
-on a standard Google Colab local disk (~113 GB) — this is especially true once
-`02_preprocess.ipynb` generates 9 full-resolution radius maps per frame. Trying to extract
-everything in one pass reliably ends in `OSError: [Errno 28] No space left on device`,
-even when the extraction target is Google Drive itself (Colab's Drive mount still stages
-every write through local disk before syncing, so it hits the same wall).
-
-The workflow that actually works — **process 3 classes at a time**:
-
-1. Pick **3 classes** (edit `EXTRACT_THESE_CLASSES` in `01_setup.ipynb` Cell 6).
-2. Run `01_setup.ipynb` → `02_preprocess.ipynb` for just those 3 classes — extraction through
-   all preprocessing steps (poses, radius maps, splits), stopping **before** modeling.
-3. Save the preprocessed output for those 3 classes back to Google Drive so it persists.
-4. **Fully disconnect the Colab runtime** (`Runtime → Disconnect and delete runtime`) to
-   reclaim local disk — a plain "Restart runtime" does *not* free disk, only the kernel.
-5. Reconnect, pick the **next 3 classes**, and repeat steps 1–4.
-6. Once all 13 classes have been extracted + preprocessed this way and saved to Drive, move
-   on to `03_yolo_train.ipynb` / `04_pose_train.ipynb` (modeling) — training needs all classes
-   present together (it uses `ConcatDataset` across classes, so partial/sequential training
-   per class is **not** an option — that causes catastrophic forgetting).
-
----
-
-## 🏗️ Model Architecture: EnhancedRCVPose
-
-```
-RGB  (3, H, W)  ──► ResNet50 backbone ──► FPN ──► Attention ──┐
-                                                                ├──► Fusion (512→256 conv)
-Depth (1, H, W) ──► ResNet50 backbone ──► FPN ──► Attention ──┘
-                                                      │
-                                          ┌───────────┴───────────┐
-                                   Global AvgPool           Outside9 Head
-                                          │                        │
-                                    Pose Head                (9, H, W) radius maps
-                                          │
-                                  [tx, ty, tz, qx, qy, qz, qw]
-```
-
-**Key components:**
-- **Dual ResNet50 backbone** — separate encoders for RGB and depth
-- **Feature Pyramid Network (FPN)** — multi-scale feature extraction
-- **Self-Attention modules** — spatial attention on fused features
-- **Pose head** — outputs 7-D pose vector `[translation (3) + quaternion (4)]`
-- **Outside9 head** — outputs 9 radius maps `(H, W)` for keypoint supervision
-
----
-
-## 📊 Training Strategy
-
-### Stage 1 — Warm-up (epochs 0–14, backbone frozen)
-- Only pose head and outside9 head are trained
-- OneCycleLR scheduler with `max_lr=1e-3`
-- Prevents destroying pretrained ResNet50 features
-
-### Stage 2 — Full fine-tune (epochs 15–79, backbone unfrozen)
-- All parameters trained with lower LR (`3e-4`)
-- CosineAnnealingLR scheduler
-- Early stopping with `patience=15`
-
-### Stage 3 — Rotation fine-tune (10 epochs)
-- Backbone frozen again
-- `W_ROT=15` (higher weight on geodesic rotation loss)
-- Typically gives **1–2° improvement** in rotation error
-
-### GPU Optimisations
-| Technique | Benefit |
-|-----------|---------|
-| `torch.compile()` | +15–25% throughput (PyTorch ≥ 2.0) |
-| AMP (`autocast` + `GradScaler`) | ~2× faster, FP16 activations |
-| Gradient accumulation (×4) | Effective batch = 32 |
-| `pin_memory` + `persistent_workers` | Faster CPU→GPU transfers |
-| `prefetch_factor=2` | Reduces data loading bottleneck |
-
----
-
-## 📉 Loss Function: WeightedPoseLoss
-
-```
-L = W_TRANS × L_trans + W_ROT × L_rot + W_PTS × L_pts
-```
-
-| Component | Formula | Default Weight |
-|-----------|---------|---------------|
-| `L_trans` | L1 loss on translation `[tx, ty, tz]` | 1.0 |
-| `L_rot` | Geodesic loss: `arccos(\|q_pred · q_gt\|)` | 10.0 |
-| `L_pts` | MSE on 9 radius maps `(H, W)` | 1.0 |
-
-Rotation is weighted 10× higher because angular error is harder to minimise.
-
----
-
-## 📐 Evaluation Metrics
-
-| Metric | Formula | Target |
-|--------|---------|--------|
-| **Translation RMSE** | √ mean(‖t_pred − t_gt‖²) | < 2 cm |
-| **Rotation Error** | 2·arccos(\|q̂·q̂_gt\|) | < 5° |
-| **Points MSE** | mean((R_pred − R_gt)²) | lower is better |
-| **ADD** | mean‖(R_p·m + t_p) − (R_g·m + t_g)‖ | < per-class threshold |
-| **ADD Success %** | frames with ADD < threshold | > 90% |
-
----
-
-## 🗃️ Dataset: LineMOD
-
-**13 objects** with known 3D models (APE, BENCHVISE, BOWL, CAMERA, CAN, CAT, CUP, DRILLER, DUCK, EGGBOX, GLUE, HOLEPUNCHER, IRON, LAMP, PHONE).
-
-**Data split per class:**
-- 80% → train
-- 10% → val
-- 10% → test (held-out, evaluate only once!)
-
-**Per-sample data:**
-```
-data/XX/
-  rgb/          ← RGB images (.png)
-  depth/        ← Depth images (.dpt, uint16 mm)
-  pose/         ← Ground-truth pose matrices (.npy, 4×4)
-  mask/         ← Object masks (.png)
-  Out_pt1_dm/   ← Radius map for keypoint 1 (.npy)
-  ...
-  Out_pt9_dm/   ← Radius map for keypoint 9 (.npy)
-  Split/        ← train.txt / val.txt / test.txt
-  mesh.ply      ← 3D mesh for ADD metric + visualization
-  gt.yml        ← Bounding boxes for YOLO training
-```
-
----
-
-## 📦 Requirements
-
-```
-torch >= 2.0
-torchvision
-ultralytics       # YOLOv8
-open3d            # Mesh loading for ADD metric + visualization
-scipy             # Quaternion utilities
-opencv-python
-Pillow
-numpy
-pandas
-matplotlib
-tqdm
-PyYAML
-```
-
-Install all:
-```bash
-pip install -r requirements.txt
-```
-
----
-
 ## 🔧 Configuration
 
-All paths and settings are centralised in `/content/config.json` (created by `01_setup.ipynb`):
+All paths and shared settings live in `/content/config.json`, written by `01_setup.ipynb` and
+extended by later notebooks (`YOLO_MODEL_PATH`, `BEST_POSE_MODEL`, …) as they produce artifacts:
 
 ```json
 {
-  "DATA_DIR": "/content/dataset/linemod/.../data",
-  "YOLO_DIR": "/content/Linemod_ready",
+  "DATA_DIR": "/content/dataset/linemod/Linemod_preprocessed/data",
+  "YOLO_DIR": "/content/dataset/linemod/Linemod_ready",
   "DRIVE_MODELS": "/content/drive/MyDrive/models",
-  "REPO_DIR": "/content/6D-pose-estimation-main",
+  "REPO_DIR": "/content/6D-pose-estimation",
   "ALL_CLASSES": ["01","02","04","05","06","08","09","10","11","12","13","14","15"],
-  "CLASS_NAMES": ["ape","benchvise","bowl","camera","can","cat","cup","driller","duck","eggbox","glue","holepuncher","iron"],
+  "CLASS_NAMES": ["ape","benchvise","cam","can","cat","driller","duck","eggbox","glue","holepuncher","iron","lamp","phone"],
   "CAMERA_K": [[572.4114, 0, 325.2611], [0, 573.57043, 242.04899], [0, 0, 1]],
-  "ADD_THRESHOLDS": {"01": 0.01421, "05": 0.02841, "08": 0.03187, ...},
-  "YOLO_YAML": "/content/linemod_yolo.yaml",
+  "ADD_THRESHOLDS": {"01": 0.01421, "02": 0.03309, "...": "..."},
   "YOLO_MODEL_PATH": "...Drive.../yolo_best.pt",
-  "BEST_POSE_MODEL": "...Drive.../best_rcvpose_YYYYMMDD_HHMMSS_finetuned.pth"
+  "BEST_POSE_MODEL": "...Drive.../best_rcvpose_<timestamp>_finetuned.pth"
 }
 ```
 
----
-
-## 🖼️ Sample Outputs
-
-| Original | GT Pose (red) | Predicted Pose (green) |
-|----------|--------------|----------------------|
-| ![](sample_output/pose_estimate_pred1.jpg) | — | ![](sample_output/pose_estimate_pred2.jpg) |
+Re-running `01_setup.ipynb`'s config cell **merges** with any existing `config.json` rather than
+overwriting it, so keys added later by other notebooks survive; `05_evaluate.ipynb` and
+`06_visualize.ipynb` additionally auto-detect the newest checkpoint on Drive if `BEST_POSE_MODEL`
+is ever missing, instead of failing to load a model.
 
 ---
 
 ## 📚 References
 
-- **RCVPose**: Xu et al., *RCVPose: Recovery of 3D Pose from Radial Correspondences*
-- **YOLOv8**: Ultralytics — [https://github.com/ultralytics/ultralytics](https://github.com/ultralytics/ultralytics)
-- **LineMOD Dataset**: Hinterstoisser et al., *Model Based Training, Detection and Pose Estimation of Texture-Less 3D Objects in Heavily Cluttered Scenes*
-- **ADD Metric**: Xiang et al., *PoseCNN: A Convolutional Neural Network for 6D Object Pose Estimation in Cluttered Scenes*
+- **RCVPose** — Xu et al., *RCVPose: Recovery of 3D Pose from Radial Correspondences*
+- **6-D rotation representation** — Zhou et al., *On the Continuity of Rotation Representations in Neural Networks* ([arXiv:1812.07035](https://arxiv.org/abs/1812.07035))
+- **LINEMOD dataset** — Hinterstoisser et al., *Model Based Training, Detection and Pose Estimation of Texture-Less 3D Objects in Heavily Cluttered Scenes*
+- **ADD metric** — Xiang et al., *PoseCNN: A Convolutional Neural Network for 6D Object Pose Estimation in Cluttered Scenes*
+- **YOLOv8** — [Ultralytics](https://github.com/ultralytics/ultralytics)

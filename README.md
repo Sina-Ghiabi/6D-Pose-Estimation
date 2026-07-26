@@ -1,5 +1,10 @@
 # 🎯 6D Pose Estimation — EnhancedRCVPose + YOLOv8
 
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Ultralytics YOLOv8](https://img.shields.io/badge/YOLOv8-Ultralytics-00FFFF?logo=yolo&logoColor=white)](https://github.com/ultralytics/ultralytics)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Sina-Ghiabi/6D-Pose-Estimation/blob/master/01_setup.ipynb)
+
 A complete, Colab-first pipeline for **6D object pose estimation** on the **LINEMOD** dataset:
 an RGB-D dual-backbone network (**EnhancedRCVPose**) predicts each object's full 3D rotation +
 translation, refined at inference time with depth-based ICP, alongside a **YOLOv8** detector for
@@ -7,6 +12,9 @@ translation, refined at inference time with depth-based ICP, alongside a **YOLOv
 
 Six notebooks take you from raw dataset zips to a trained, evaluated, visualized model —
 `01_setup` → `02_preprocess` → `03_yolo_train` → `04_pose_train` → `05_evaluate` → `06_visualize`.
+
+### Contents
+[Results](#-results) · [Architecture](#%EF%B8%8F-architecture--enhancedrcvpose) · [Key Engineering Decisions](#-key-engineering-decisions) · [Quick Start](#-quick-start-google-colab) · [Training & Loss](#-training-strategy--loss) · [Evaluation](#-evaluation-pipeline) · [Dataset](#%EF%B8%8F-dataset-linemod) · [Project Structure](#-project-structure) · [Configuration](#-configuration) · [References](#-references)
 
 ---
 

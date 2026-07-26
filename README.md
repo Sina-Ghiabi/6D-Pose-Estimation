@@ -14,7 +14,7 @@ Six notebooks take you from raw dataset zips to a trained, evaluated, visualized
 `01_setup` → `02_preprocess` → `03_yolo_train` → `04_pose_train` → `05_evaluate` → `06_visualize`.
 
 ### Contents
-[Results](#-results) · [Architecture](#%EF%B8%8F-architecture--enhancedrcvpose) · [Pipeline Walkthrough](#-pipeline-walkthrough--what-actually-happens-to-the-data) · [Key Engineering Decisions](#-key-engineering-decisions) · [Quick Start](#-quick-start-google-colab) · [Training & Loss](#-training-strategy--loss) · [Evaluation](#-evaluation-pipeline) · [Dataset](#%EF%B8%8F-dataset-linemod) · [Project Structure](#-project-structure) · [Configuration](#-configuration) · [References](#-references)
+[Results](#-results) · [Architecture](#%EF%B8%8F-architecture--enhancedrcvpose) · [Quick Start](#-quick-start-google-colab) · [Training & Loss](#-training-strategy--loss) · [Evaluation](#-evaluation-pipeline) · [Dataset](#%EF%B8%8F-dataset-linemod) · [Project Structure](#-project-structure) · [Configuration](#-configuration) · [Pipeline Walkthrough](#-pipeline-walkthrough--what-actually-happens-to-the-data) · [Key Engineering Decisions](#-key-engineering-decisions) · [References](#-references)
 
 ---
 
@@ -64,6 +64,139 @@ Depth (1, H, W) ──► ResNet50 backbone ──► FPN ──► Attention �
   used, so the loss weight didn't need retuning when this changed.
 - **Outside9 head** — 9 per-pixel radius maps (distance from each pixel to one of 9 FPS-sampled
   3D keypoints), trained as auxiliary supervision.
+
+---
+
+## 🚀 Quick Start (Google Colab)
+
+Run the notebooks **in order**, in the same Colab session/runtime:
+
+| Step | Notebook | What it does |
+|---|---|---|
+| 1 | `01_setup.ipynb` | Mount Drive, install packages, verify GPU, write `config.json`, clone this repo |
+| 2 | `02_preprocess.ipynb` | Extract + preprocess each class end-to-end (poses, keypoints, splits) |
+| 3 | `03_yolo_train.ipynb` | Train YOLOv8s for 2D object detection |
+| 4 | `04_pose_train.ipynb` | Train EnhancedRCVPose — frozen warm-up → full fine-tune → rotation fine-tune |
+| 5 | `05_evaluate.ipynb` | Validation + held-out test metrics (Translation RMSE, Rotation Error, ADD) |
+| 6 | `06_visualize.ipynb` | Pose wireframe overlays, YOLO detections, radius-map heatmaps |
+
+Every notebook reads `/content/config.json` (written by `01_setup.ipynb`) — no paths are
+hardcoded or copy-pasted between notebooks.
+
+**Local / non-Colab setup:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
+The notebooks assume Colab-style paths (`/content/...`) and Google Drive mounting; adapt
+`01_setup.ipynb`'s config cell if running elsewhere.
+
+---
+
+## 📉 Training strategy & loss
+
+**Three stages** (`04_pose_train.ipynb`):
+
+| Stage | Epochs | Backbone | LR schedule | Notes |
+|---|---|---|---|---|
+| 1 — Warm-up | 15 | frozen | `OneCycleLR`, peak `1e-3` | Only `pose_head`/`outside9_head` train; BatchNorm frozen too |
+| 2 — Full fine-tune | up to 65 | unfrozen | fresh `OneCycleLR`, peak `3e-4` | Early stopping, `patience=15` |
+| 3 — Rotation fine-tune | 10 | frozen again | `CosineAnnealingLR`, `1e-4` | Same rotation weight as main training |
+
+`WeightedPoseLoss`:
+```
+L = W_TRANS · L_trans + W_ROT · L_rot + W_PTS · L_pts        (1.0, 10.0, 1.0)
+```
+- `L_trans` — MSE on `[tx, ty, tz]`
+- `L_rot` — geodesic angle between the predicted (6-D-decoded) and ground-truth rotation matrices
+- `L_pts` — MSE on the 9 predicted radius maps
+
+Gradient accumulation, AMP (`autocast` + `GradScaler`), `pin_memory`, and `persistent_workers`
+are used throughout; batch size / worker count auto-scale to the detected GPU (H100/A100/T4).
+
+---
+
+## 📐 Evaluation pipeline
+
+`05_evaluate.ipynb`, per sample:
+1. Run the network → decode the 9-D output to `[t, quaternion]`.
+2. Replace `t` with the depth+mask centroid translation guess (see [Key Engineering Decisions](#-key-engineering-decisions)).
+3. Refine `[t, quaternion]` with two-stage ICP against the observed depth point cloud.
+4. Score against ground truth: Translation RMSE, Rotation Error, Points MSE, ADD, ADD Success %.
+
+ADD success uses **per-class thresholds** (`config.json`'s `ADD_THRESHOLDS`, standard LINEMOD
+benchmark values) and mesh points loaded unscaled (matching this project's original reference
+implementation), so results are directly comparable across runs.
+
+---
+
+## 🗃️ Dataset: LINEMOD
+
+13 classes (2 of the standard 15 are excluded — texture-poor/ambiguous geometry):
+
+`ape · benchvise · cam · can · cat · driller · duck · eggbox · glue · holepuncher · iron · lamp · phone`
+
+**Split per class** (`02_preprocess.ipynb`, deterministic per-class seed): **70% train / 20% val
+/ 10% test** — test is held out and should only be scored once at the end.
+
+**Per-class layout after preprocessing:**
+```
+data/XX/
+  rgb/          RGB images (.png)
+  depth/        Depth images (.dpt — binary uint16, millimetres)
+  pose/         Ground-truth [R|t] matrices (.npy, 3x4), translation in metres
+  mask/         Object masks (.png)
+  mesh.ply      3D model — ADD metric + visualization
+  Outside9.npy  9 FPS-sampled 3D keypoints (mm) — radius maps derived from these on-the-fly
+  Split/        train.txt / val.txt / test.txt
+  gt.yml        Original ground-truth (kept for reference; not read after preprocessing)
+```
+
+---
+
+## 📁 Project Structure
+
+```
+6D-pose-estimation/
+├── 01_setup.ipynb          # Env setup, Drive mount, GPU check, config.json, repo clone
+├── 02_preprocess.ipynb     # Per-class extraction, poses, keypoints, splits
+├── 03_yolo_train.ipynb     # YOLOv8s detection training
+├── 04_pose_train.ipynb     # EnhancedRCVPose training (3 stages)
+├── 05_evaluate.ipynb       # Validation + test metrics
+├── 06_visualize.ipynb      # Pose overlays, YOLO detections, radius-map heatmaps
+├── src/
+│   ├── model.py             # EnhancedRCVPose, WeightedPoseLoss, 6-D rotation helpers
+│   └── dataset.py           # PoseDataset (on-the-fly radius maps), augmentation, safe_collate
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 🔧 Configuration
+
+All paths and shared settings live in `/content/config.json`, written by `01_setup.ipynb` and
+extended by later notebooks (`YOLO_MODEL_PATH`, `BEST_POSE_MODEL`, …) as they produce artifacts:
+
+```json
+{
+  "DATA_DIR": "/content/dataset/linemod/Linemod_preprocessed/data",
+  "YOLO_DIR": "/content/dataset/linemod/Linemod_ready",
+  "DRIVE_MODELS": "/content/drive/MyDrive/models",
+  "REPO_DIR": "/content/6D-pose-estimation",
+  "ALL_CLASSES": ["01","02","04","05","06","08","09","10","11","12","13","14","15"],
+  "CLASS_NAMES": ["ape","benchvise","cam","can","cat","driller","duck","eggbox","glue","holepuncher","iron","lamp","phone"],
+  "CAMERA_K": [[572.4114, 0, 325.2611], [0, 573.57043, 242.04899], [0, 0, 1]],
+  "ADD_THRESHOLDS": {"01": 0.01421, "02": 0.03309, "...": "..."},
+  "YOLO_MODEL_PATH": "...Drive.../yolo_best.pt",
+  "BEST_POSE_MODEL": "...Drive.../best_rcvpose_<timestamp>_finetuned.pth"
+}
+```
+
+Re-running `01_setup.ipynb`'s config cell **merges** with any existing `config.json` rather than
+overwriting it, so keys added later by other notebooks survive; `05_evaluate.ipynb` and
+`06_visualize.ipynb` additionally auto-detect the newest checkpoint on Drive if `BEST_POSE_MODEL`
+is ever missing, instead of failing to load a model.
 
 ---
 
@@ -159,139 +292,6 @@ into every augmented sample. Computing the correct compensating rotation is a re
 sign/convention error that's hard to catch without live testing; removing the rotation step (color
 jitter + depth noise remain) is the safer trade — it costs a small amount of augmentation
 diversity in exchange for zero risk of a *new*, harder-to-detect bug.
-
----
-
-## 🚀 Quick Start (Google Colab)
-
-Run the notebooks **in order**, in the same Colab session/runtime:
-
-| Step | Notebook | What it does |
-|---|---|---|
-| 1 | `01_setup.ipynb` | Mount Drive, install packages, verify GPU, write `config.json`, clone this repo |
-| 2 | `02_preprocess.ipynb` | Extract + preprocess each class end-to-end (poses, keypoints, splits) |
-| 3 | `03_yolo_train.ipynb` | Train YOLOv8s for 2D object detection |
-| 4 | `04_pose_train.ipynb` | Train EnhancedRCVPose — frozen warm-up → full fine-tune → rotation fine-tune |
-| 5 | `05_evaluate.ipynb` | Validation + held-out test metrics (Translation RMSE, Rotation Error, ADD) |
-| 6 | `06_visualize.ipynb` | Pose wireframe overlays, YOLO detections, radius-map heatmaps |
-
-Every notebook reads `/content/config.json` (written by `01_setup.ipynb`) — no paths are
-hardcoded or copy-pasted between notebooks.
-
-**Local / non-Colab setup:**
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install -r requirements.txt
-```
-The notebooks assume Colab-style paths (`/content/...`) and Google Drive mounting; adapt
-`01_setup.ipynb`'s config cell if running elsewhere.
-
----
-
-## 📉 Training strategy & loss
-
-**Three stages** (`04_pose_train.ipynb`):
-
-| Stage | Epochs | Backbone | LR schedule | Notes |
-|---|---|---|---|---|
-| 1 — Warm-up | 15 | frozen | `OneCycleLR`, peak `1e-3` | Only `pose_head`/`outside9_head` train; BatchNorm frozen too |
-| 2 — Full fine-tune | up to 65 | unfrozen | fresh `OneCycleLR`, peak `3e-4` | Early stopping, `patience=15` |
-| 3 — Rotation fine-tune | 10 | frozen again | `CosineAnnealingLR`, `1e-4` | Same rotation weight as main training |
-
-`WeightedPoseLoss`:
-```
-L = W_TRANS · L_trans + W_ROT · L_rot + W_PTS · L_pts        (1.0, 10.0, 1.0)
-```
-- `L_trans` — MSE on `[tx, ty, tz]`
-- `L_rot` — geodesic angle between the predicted (6-D-decoded) and ground-truth rotation matrices
-- `L_pts` — MSE on the 9 predicted radius maps
-
-Gradient accumulation, AMP (`autocast` + `GradScaler`), `pin_memory`, and `persistent_workers`
-are used throughout; batch size / worker count auto-scale to the detected GPU (H100/A100/T4).
-
----
-
-## 📐 Evaluation pipeline
-
-`05_evaluate.ipynb`, per sample:
-1. Run the network → decode the 9-D output to `[t, quaternion]`.
-2. Replace `t` with the depth+mask centroid translation guess (see above).
-3. Refine `[t, quaternion]` with two-stage ICP against the observed depth point cloud.
-4. Score against ground truth: Translation RMSE, Rotation Error, Points MSE, ADD, ADD Success %.
-
-ADD success uses **per-class thresholds** (`config.json`'s `ADD_THRESHOLDS`, standard LINEMOD
-benchmark values) and mesh points loaded unscaled (matching this project's original reference
-implementation), so results are directly comparable across runs.
-
----
-
-## 🗃️ Dataset: LINEMOD
-
-13 classes (2 of the standard 15 are excluded — texture-poor/ambiguous geometry):
-
-`ape · benchvise · cam · can · cat · driller · duck · eggbox · glue · holepuncher · iron · lamp · phone`
-
-**Split per class** (`02_preprocess.ipynb`, deterministic per-class seed): **70% train / 20% val
-/ 10% test** — test is held out and should only be scored once at the end.
-
-**Per-class layout after preprocessing:**
-```
-data/XX/
-  rgb/          RGB images (.png)
-  depth/        Depth images (.dpt — binary uint16, millimetres)
-  pose/         Ground-truth [R|t] matrices (.npy, 3x4), translation in metres
-  mask/         Object masks (.png)
-  mesh.ply      3D model — ADD metric + visualization
-  Outside9.npy  9 FPS-sampled 3D keypoints (mm) — radius maps derived from these on-the-fly
-  Split/        train.txt / val.txt / test.txt
-  gt.yml        Original ground-truth (kept for reference; not read after preprocessing)
-```
-
----
-
-## 📁 Project Structure
-
-```
-6D-pose-estimation/
-├── 01_setup.ipynb          # Env setup, Drive mount, GPU check, config.json, repo clone
-├── 02_preprocess.ipynb     # Per-class extraction, poses, keypoints, splits
-├── 03_yolo_train.ipynb     # YOLOv8s detection training
-├── 04_pose_train.ipynb     # EnhancedRCVPose training (3 stages)
-├── 05_evaluate.ipynb       # Validation + test metrics
-├── 06_visualize.ipynb      # Pose overlays, YOLO detections, radius-map heatmaps
-├── src/
-│   ├── model.py             # EnhancedRCVPose, WeightedPoseLoss, 6-D rotation helpers
-│   └── dataset.py           # PoseDataset (on-the-fly radius maps), augmentation, safe_collate
-├── requirements.txt
-└── README.md
-```
-
----
-
-## 🔧 Configuration
-
-All paths and shared settings live in `/content/config.json`, written by `01_setup.ipynb` and
-extended by later notebooks (`YOLO_MODEL_PATH`, `BEST_POSE_MODEL`, …) as they produce artifacts:
-
-```json
-{
-  "DATA_DIR": "/content/dataset/linemod/Linemod_preprocessed/data",
-  "YOLO_DIR": "/content/dataset/linemod/Linemod_ready",
-  "DRIVE_MODELS": "/content/drive/MyDrive/models",
-  "REPO_DIR": "/content/6D-pose-estimation",
-  "ALL_CLASSES": ["01","02","04","05","06","08","09","10","11","12","13","14","15"],
-  "CLASS_NAMES": ["ape","benchvise","cam","can","cat","driller","duck","eggbox","glue","holepuncher","iron","lamp","phone"],
-  "CAMERA_K": [[572.4114, 0, 325.2611], [0, 573.57043, 242.04899], [0, 0, 1]],
-  "ADD_THRESHOLDS": {"01": 0.01421, "02": 0.03309, "...": "..."},
-  "YOLO_MODEL_PATH": "...Drive.../yolo_best.pt",
-  "BEST_POSE_MODEL": "...Drive.../best_rcvpose_<timestamp>_finetuned.pth"
-}
-```
-
-Re-running `01_setup.ipynb`'s config cell **merges** with any existing `config.json` rather than
-overwriting it, so keys added later by other notebooks survive; `05_evaluate.ipynb` and
-`06_visualize.ipynb` additionally auto-detect the newest checkpoint on Drive if `BEST_POSE_MODEL`
-is ever missing, instead of failing to load a model.
 
 ---
 

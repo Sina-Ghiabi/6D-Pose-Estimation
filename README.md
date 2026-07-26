@@ -202,56 +202,63 @@ is ever missing, instead of failing to load a model.
 
 ## 🔄 Pipeline Walkthrough — what actually happens to the data
 
-### A. Once per object class (`02_preprocess.ipynb`)
+<p align="center">
+<b>🗂️ Preprocess</b>&nbsp;(once per class)&nbsp;→&nbsp;<b>📥 Load sample</b>&nbsp;(every step)&nbsp;→&nbsp;<b>🧠 Forward pass</b>&nbsp;(the network)&nbsp;→&nbsp;<b>🎯 Refine pose</b>&nbsp;(eval time)
+</p>
 
-1. **Extract** that class's RGB images, depth maps, masks, and `gt.yml` (ground truth) from the
-   Drive zip to local disk.
-2. **Copy the 3D model** (`mesh.ply`) for that object.
-3. **Farthest-Point Sampling (FPS) on the 3D mesh** — starting from a random vertex, repeatedly
-   pick the mesh vertex farthest (in 3D) from every point already chosen, 9 times. This gives 9
-   keypoints spread as widely as possible across the object's surface (`Outside9.npy`) — maximally
-   spread points make the strongest, least-ambiguous geometric constraints later, when they're
-   used to recover a pose from radius maps or align a mesh with ICP. This runs **once per object**,
-   directly on the mesh — not per image, and not on the RGB frame.
-4. **Extract ground-truth pose** `(R, t)` for every frame from `gt.yml`.
-5. **Rename, convert, split**: files renamed to a consistent 6-digit ID, depth converted from PNG
-   to a compact binary `.dpt` format, frames split 70/20/10 into train/val/test.
-6. **Normalise units** (mm → m) and sanity-check every file.
+<details open>
+<summary><b>A. Once per object class</b> — <code>02_preprocess.ipynb</code></summary>
+<br>
 
-### B. Every time a sample is loaded (`PoseDataset`, train **and** eval)
+| Step | What happens |
+|---|---|
+| 1. Extract | Pull that class's RGB, depth, masks, and `gt.yml` (ground truth) from the Drive zip |
+| 2. Copy 3D model | `mesh.ply` for that object |
+| 3. **Farthest-Point Sampling** | On the **3D mesh itself** — starting from a random vertex, repeatedly pick whichever vertex is farthest (in 3D) from every point chosen so far, 9 times → `Outside9.npy`. Maximally-spread keypoints give the strongest, least-ambiguous geometric constraints later (radius maps, ICP). Runs **once per object**, on the mesh — not per image |
+| 4. Extract poses | Ground-truth `(R, t)` for every frame, from `gt.yml` |
+| 5. Rename · convert · split | 6-digit IDs, depth PNG → binary `.dpt`, 70 / 20 / 10 train-val-test split |
+| 6. Normalise | mm → m, sanity-check every file |
 
-1. Load that frame's **RGB image**, **depth map**, **mask**, and **ground-truth pose**.
-2. **The mask is applied to the depth map** — pixels outside the object's silhouette are zeroed
-   out, so only depth values that actually belong to the object contribute to anything downstream
-   (radius maps during training, the translation guess during evaluation — see below).
-3. **Compute the 9 radius maps on-the-fly**: for each of the 9 mesh keypoints from step A.3, and
-   for every masked-in (foreground) pixel, back-project that pixel to a 3D camera-space point using
-   the depth value and camera intrinsics, then measure its distance to the keypoint. The result is
-   9 dense per-pixel "distance-to-keypoint" maps, matching the RGB frame's resolution — this is
-   what the model's `outside9_head` is trained to reproduce.
-4. *(training only)* Apply colour-jitter + depth-noise augmentation, then normalise RGB with
-   ImageNet mean/std.
+</details>
 
-### C. Forward pass through the network (`EnhancedRCVPose`)
+<details open>
+<summary><b>B. Every time a sample is loaded</b> — <code>PoseDataset</code>, train <i>and</i> eval</summary>
+<br>
 
-1. RGB → its own ResNet50 → FPN → self-attention.
-2. Depth → a **separate** ResNet50 → FPN → self-attention (its first conv layer is initialised
-   from the RGB backbone's, averaged across channels, since depth is single-channel).
-3. **Fuse** both attended feature maps (concatenate + conv).
-4. From the fused features: **global-average-pool → `pose_head`** → a 9-D vector (3 translation +
-   6-D rotation); separately, the *un-pooled* fused features → **`outside9_head`** → the predicted
-   9 radius maps, upsampled back to the input resolution.
+| Step | What happens |
+|---|---|
+| 1. Load | That frame's RGB, depth, mask, and ground-truth pose |
+| 2. **Mask the depth** | Pixels outside the object's silhouette are zeroed out, so only real object geometry feeds anything downstream (radius maps here, the translation guess at eval time) |
+| 3. **Radius maps, on-the-fly** | For each of the 9 mesh keypoints, and every masked-in pixel: back-project the pixel to 3D using its depth + camera intrinsics, then measure its distance to the keypoint → 9 dense per-pixel maps, matching the frame's resolution. This is `outside9_head`'s training target |
+| 4. Augment *(train only)* | Colour jitter + depth noise, then ImageNet-normalise RGB |
 
-### D. Turning the raw prediction into a final pose (`05_evaluate.ipynb` / `06_visualize.ipynb`)
+</details>
 
-1. **Decode** the 9-D output to the standard `[t, quaternion]` form (Gram-Schmidt on the 6-D part
-   → rotation matrix → quaternion).
-2. **Replace the translation** with the measured centroid of the masked, depth-sensor 3D points
-   from step B.2 — the network's own translation regression is the weakest part of its output (see
-   below), so it's discarded here in favour of a direct geometric measurement.
-3. **Refine with two-stage ICP** against the full observed depth point cloud: a coarse
-   point-to-point pass, then a finer point-to-plane pass seeded by the coarse result.
-4. Score the final `[t, quaternion]` against ground truth (Translation RMSE, Rotation Error, ADD).
+<details open>
+<summary><b>C. Forward pass through the network</b> — <code>EnhancedRCVPose</code></summary>
+<br>
+
+| Step | What happens |
+|---|---|
+| 1. RGB branch | ResNet50 → FPN → self-attention |
+| 2. Depth branch | A **separate** ResNet50 → FPN → self-attention (`conv1` seeded from the RGB backbone's, channel-averaged) |
+| 3. Fuse | Concatenate both attended feature maps + conv |
+| 4. Two heads | Fused features **pooled** → `pose_head` → 9-D `[t, 6-D rotation]` · fused features **un-pooled** → `outside9_head` → 9 radius maps, upsampled to input resolution |
+
+</details>
+
+<details open>
+<summary><b>D. Raw prediction → final pose</b> — <code>05_evaluate.ipynb</code> / <code>06_visualize.ipynb</code></summary>
+<br>
+
+| Step | What happens |
+|---|---|
+| 1. Decode | 9-D output → `[t, quaternion]` (Gram-Schmidt on the 6-D part → rotation matrix → quaternion) |
+| 2. **Replace translation** | Swap in the measured centroid of the masked depth points from step B.2 — the network's own translation is its weakest output, so a direct geometric measurement replaces it |
+| 3. **Two-stage ICP** | Coarse point-to-point pass, then a finer point-to-plane pass seeded by the coarse result, against the full observed depth point cloud |
+| 4. Score | Final `[t, quaternion]` vs. ground truth → Translation RMSE, Rotation Error, ADD |
+
+</details>
 
 ---
 

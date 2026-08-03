@@ -434,3 +434,4 @@ All paths and shared settings live in `/content/config.json`, written by
 <div align="center">
 <sub>6D object pose estimation on LINEMOD — EnhancedRCVPose (dual-ResNet50 + FPN + attention) with YOLOv8 detection and ICP refinement.</sub>
 </div>
+
